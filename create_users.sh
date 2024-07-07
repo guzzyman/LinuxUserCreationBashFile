@@ -1,100 +1,83 @@
 #!/bin/bash
 
-# Check if the script is run as root (superuser)
-if [ "$(id -u)" -ne 0 ]; then
-    echo "Please run this script as root or using sudo."
-    exit 1
+# Script arguments validation
+if [ $# -ne 1 ]; then
+  echo "Usage: $0 <user_data_file>"
+  exit 1
 fi
 
-# Check if the input file is provided
-if [ -z "$1" ]; then
-    echo "Usage: $0 <name-of-text-file>"
-    exit 1
-fi
+# Define log and password files
+log_file="/var/log/user_management.log"
+password_file="/var/secure/user_passwords.txt"
 
-INPUT_FILE="$1"
-LOG_FILE="/var/log/user_management.log"
-PASSWORD_FILE="/var/secure/user_passwords.csv"
+# Ensure log and password file directories exist
+mkdir -p $(dirname "$log_file")
+mkdir -p $(dirname "$password_file")
 
-# Create log and password files if they do not exist
-touch $LOG_FILE
-mkdir -p /var/secure
-touch $PASSWORD_FILE
-chmod 600 $PASSWORD_FILE
+# Set permissions for password file (read-only for owner)
+touch "$password_file"
+chmod 600 "$password_file"
 
-# Function to generate random passwords
-generate_password() {
-    openssl rand -base64 12
-}
-
-# Read the input file line by line
+# Loop through each line in the user data file
 while IFS=';' read -r username groups; do
-    username=$(echo "$username" | xargs)
-    groups=$(echo "$groups" | xargs)
 
-    # Check if user already exists
-    if id "$username" &>/dev/null; then
-        echo "User $username already exists, skipping..." | tee -a $LOG_FILE
-        continue
+  # Remove leading/trailing whitespace
+  username=${username## }
+  username=${username%% }
+  groups=${groups## }
+  groups=${groups%% }
+
+  # Create user group (same as username)
+  groupadd "$username" &>> "$log_file"
+
+  # Check if group already exists
+  if [ $? -eq 0 ]; then
+    echo "Group '$username' created successfully." >> "$log_file"
+  else
+    echo "Failed to create group '$username'. Skipping..." >> "$log_file"
+  fi
+
+  # Check if user already exists
+  if id "$username" &> /dev/null; then
+    echo "User '$username' already exists." >> "$log_file"
+  else
+    # Generate random password
+    password=$(< /dev/urandom tr -dc A-Za-z0-9 | head -c16)
+    echo "$username:$password" >> "$password_file"
+
+    # Create user with random password and home directory
+    useradd -m -g "$username" -s /bin/bash "$username" &>> "$log_file"
+    echo "Password for user '$username': $password" >> "$log_file"
+
+    # Set home directory permissions
+    chown -R "$username:$username" "/home/$username" &>> "$log_file"
+    chmod 700 "/home/$username" &>> "$log_file"
+  fi
+
+  # Check if user belongs to all specified groups
+  user_groups=$(groups "$username" | cut -d ' ' -f 2-)
+  missing_groups=""
+  for group in $(echo "$groups" | tr ',' ' '); do
+    if ! [[ $user_groups =~ $group ]]; then
+      missing_groups="$missing_groups $group"
     fi
+  done
 
-    # Check if user belongs to all specified groups
-    if [ -n "$groups" ]; then
-        IFS=',' read -r -a group_array <<< "$groups"
-        for group in "${group_array[@]}"; do
-            group=$(echo "$group" | xargs)
-            if ! getent group "$group" > /dev/null; then
-                echo "Group $group does not exist, skipping..." | tee -a $LOG_FILE
-                continue 2
-            fi
-        done
-    fi
+  if [ -n "$missing_groups" ]; then
+    echo "User '$username' is missing groups: $missing_groups" >> "$log_file"
+    # Add user to missing groups (if user already existed)
+    for group in $missing_groups; do
+      usermod -a -G "$group" "$username" &>> "$log_file"
+    done
+  fi
 
-    # Check if user belongs to their personal group
-    if ! groups "$username" | grep -q "\<$username\>"; then
-        echo "User $username does not belong to their personal group, skipping..." | tee -a $LOG_FILE
-        continue
-    fi
+  # Check if user belongs to their personal group
+  if ! [[ $user_groups =~ $username ]]; then
+    echo "User '$username' is not a member of their personal group." >> "$log_file"
+    # Add user to their personal group
+    usermod -a -G "$username" "$username" &>> "$log_file"
+  fi
 
-    # Create a personal group for the user
-    addgroup "$username"
+done < "$1"
 
-    # Create the user with the personal group and home directory
-    adduser -D -G "$username" -s /bin/bash "$username"
-
-    # Add the user to additional groups if specified
-    if [ -n "$groups" ]; then
-        IFS=',' read -r -a group_array <<< "$groups"
-        for group in "${group_array[@]}"; do
-            group=$(echo "$group" | xargs)
-            if ! getent group "$group" > /dev/null; then
-                addgroup "$group"
-            fi
-            adduser "$username" "$group"
-        done
-    fi
-
-    # Check if groups are created and user is added even if user already exists
-    if id "$username" &>/dev/null; then
-        for group in "${group_array[@]}"; do
-            if ! groups "$username" | grep -q "\<$group\>"; then
-                echo "User $username is not added to group $group, skipping..." | tee -a $LOG_FILE
-                continue 2
-            fi
-        done
-    fi
-
-    # Generate a random password for the user
-    password=$(generate_password)
-
-    # Set the user's password
-    echo "$username:$password" | chpasswd
-
-    # Log the actions
-    echo "Created user $username with groups $groups and home directory" | tee -a $LOG_FILE
-
-    # Store the username and password securely
-    echo "$username,$password" >> $PASSWORD_FILE
-done < "$INPUT_FILE"
-
-echo "User creation process completed. Check $LOG_FILE for details."
+echo "User creation script completed. Refer to logs for details: $log_file"
