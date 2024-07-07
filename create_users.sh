@@ -38,6 +38,24 @@ while IFS=';' read -r username groups; do
         continue
     fi
 
+    # Check if user belongs to all specified groups
+    if [ -n "$groups" ]; then
+        IFS=',' read -r -a group_array <<< "$groups"
+        for group in "${group_array[@]}"; do
+            group=$(echo "$group" | xargs)
+            if ! getent group "$group" > /dev/null; then
+                echo "Group $group does not exist, skipping..." | tee -a $LOG_FILE
+                continue 2
+            fi
+        done
+    fi
+
+    # Check if user belongs to their personal group
+    if ! groups "$username" | grep -q "\<$username\>"; then
+        echo "User $username does not belong to their personal group, skipping..." | tee -a $LOG_FILE
+        continue
+    fi
+
     # Create a personal group for the user
     addgroup "$username"
 
@@ -53,6 +71,16 @@ while IFS=';' read -r username groups; do
                 addgroup "$group"
             fi
             adduser "$username" "$group"
+        done
+    fi
+
+    # Check if groups are created and user is added even if user already exists
+    if id "$username" &>/dev/null; then
+        for group in "${group_array[@]}"; do
+            if ! groups "$username" | grep -q "\<$group\>"; then
+                echo "User $username is not added to group $group, skipping..." | tee -a $LOG_FILE
+                continue 2
+            fi
         done
     fi
 
